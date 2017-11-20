@@ -1,16 +1,26 @@
 import logging
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth.models import User
+from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
 from django.http import HttpResponseRedirect
 from django.template.loader import render_to_string
 from django.utils.encoding import smart_unicode
+from django.contrib.auth.models import AnonymousUser
 
 
 assert 'django.contrib.auth' in settings.INSTALLED_APPS
 assert 'django.contrib.sessions' in settings.INSTALLED_APPS
 assert 'viewas' in settings.INSTALLED_APPS
 
+if hasattr(settings, 'AUTH_USER_MODEL'):
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+else:
+    from django.contrib.auth.models import User
+
+# tilda (192) as default key
+VIEWAS_TOGGLE_KEY = getattr(settings, 'VIEWAS_TOGGLE_KEY', 192)
 
 _HTML_TYPES = ('text/html', 'application/xhtml+xml')
 
@@ -42,8 +52,22 @@ class ViewAsHookMiddleware(BaseMiddleware):
     """
     logger = logging.getLogger('viewas')
 
+    def get_user(self, username):
+        selector = User.USERNAME_FIELD + '__iexact'
+        query = {selector: username}
+        try:
+            return User.objects.get(**query)
+        except ObjectDoesNotExist:
+            # try to look up by email
+            if '@' in username:
+                try:
+                    return User.objects.get(email__iexact=username)
+                except (MultipleObjectsReturned, ObjectDoesNotExist):
+                    return None
+        return None
+
     def login_as(self, request, username):
-        if request.user.username.lower() == username.lower():
+        if request.user.get_username().lower() == username.lower():
             return
 
         if username == '':
@@ -51,17 +75,19 @@ class ViewAsHookMiddleware(BaseMiddleware):
                 del request.session['login_as']
             return
 
-        self.logger.info('User %r forced a login as %r', request.user.username, username,
+        self.logger.info(
+            'User %r forced a login as %r at %s',
+            request.user.get_username(), username, request.get_full_path(),
             extra={'request': request})
 
-        try:
-            request.user = User.objects.get(username__iexact=username)
-        except User.DoesNotExist:
+        user = self.get_user(username)
+        if user:
+            request.user = user
+            request.session['login_as'] = request.user.get_username()
+        else:
             messages.warning(request, "Did not find a user matching '%s'" % (username,))
             if 'login_as' in request.session:
                 del request.session['login_as']
-        else:
-            request.session['login_as'] = request.user.username
 
     def process_request(self, request):
         if not self.can_run(request):
@@ -95,7 +121,12 @@ class ViewAsRenderMiddleware(BaseMiddleware):
         return response
 
     def render(self, request):
+        if not isinstance(request.user, AnonymousUser):
+            request.user.username = request.user.get_username()
+        if hasattr(request, 'actual_user'):
+            request.actual_user.username = request.actual_user.get_username()
         return render_to_string('viewas/header.html', {
+            'VIEWAS_TOGGLE_KEY': VIEWAS_TOGGLE_KEY,
             'request': request,
         })
 
